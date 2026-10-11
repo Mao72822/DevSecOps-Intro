@@ -1,0 +1,70 @@
+# Lab 9 — custom Falco rules
+# Loaded from /etc/falco/rules.d/ after the shipped falco_rules.yaml,
+# so the shipped macros (open_write, ...) are available here.
+
+# ---------------------------------------------------------------------------
+# Task 1 (9.3): a write under /tmp from inside any container
+# ---------------------------------------------------------------------------
+- rule: Write Below Tmp In Container
+  desc: >
+    A process inside a container (not on the host) opened a file under /tmp/
+    for writing. /tmp is the usual drop zone for downloaded payloads and
+    scripts, so a write there is a sign of container drift.
+  condition: >
+    open_write
+    and container.id != host
+    and container.id != ""
+    and not proc.name startswith "runc"
+    and fd.name startswith /tmp/
+  output: >
+    File below /tmp opened for writing in container
+    (container=%container.name container_id=%container.id image=%container.image.repository
+    user=%user.name uid=%user.uid file=%fd.name cmdline=%proc.cmdline
+    parent=%proc.pname)
+  priority: WARNING
+  tags: [container, drift]
+
+# ---------------------------------------------------------------------------
+# Bonus: likely cryptomining — pool port AND a suspicious process
+# ---------------------------------------------------------------------------
+- list: miner_pool_ports
+  items: [3333, 4444, 5555, 7777, 14444]
+
+- list: miner_binaries
+  items: [xmrig, xmr-stak, minerd, cpuminer, cpuminer-multi, ccminer, cgminer, bfgminer, ethminer, t-rex, nbminer, lolminer]
+
+# Raw-socket tools: an application container has no reason to run these,
+# and droppers use them to talk to pools/C2 when no miner binary is present yet.
+- list: raw_net_tools
+  items: [nc, ncat, netcat, socat, telnet]
+
+- rule: Possible Cryptominer Pool Connection
+  desc: >
+    A process in a container attempted an outbound connection to a port
+    commonly used by mining pools (signal 1) AND the process is a known miner
+    binary, a raw network tool, or its command line mentions the stratum
+    protocol (signal 2). The port is taken from the address the process
+    passed to connect() (evt.arg.addr) as well as from the socket tuple
+    (fd.sport): on a refused connection the kernel returns no tuple, so
+    fd.sport is empty, but the requested address is always there.
+  condition: >
+    evt.type = connect
+    and container.id != host
+    and (fd.typechar = 4 or fd.typechar = 6)
+    and (fd.sport in (miner_pool_ports)
+         or evt.arg.addr endswith ":3333"
+         or evt.arg.addr endswith ":4444"
+         or evt.arg.addr endswith ":5555"
+         or evt.arg.addr endswith ":7777"
+         or evt.arg.addr endswith ":14444")
+    and (proc.name in (miner_binaries)
+         or proc.name in (raw_net_tools)
+         or proc.cmdline contains "stratum+tcp"
+         or proc.cmdline contains "stratum+ssl")
+  output: >
+    Possible cryptominer connecting to a pool port
+    (container=%container.name container_id=%container.id image=%container.image.repository
+    proc=%proc.name pid=%proc.pid cmdline=%proc.cmdline user=%user.name
+    requested=%evt.arg.addr dest=%fd.sip:%fd.sport connection=%fd.name result=%evt.res)
+  priority: CRITICAL
+  tags: [container, network, mitre_command_and_control, mitre_impact, T1496]
